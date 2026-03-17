@@ -212,17 +212,20 @@ class LedvanceTuyaLight(CoordinatorEntity[LedvanceTuyaCoordinator], LightEntity)
         await async_send_command(
             self.hass, self.coordinator.api, self._device_data, dps_dict
         )
+        self.coordinator.async_optimistic_update(self._device_id, dps_dict)
         await self.coordinator.async_request_refresh()
 
     async def async_turn_off(self, **kwargs: Any) -> None:
         if self._switch_dps is None:
             return
+        dps_dict = {self._switch_dps: False}
         await async_send_command(
             self.hass,
             self.coordinator.api,
             self._device_data,
-            {self._switch_dps: False},
+            dps_dict,
         )
+        self.coordinator.async_optimistic_update(self._device_id, dps_dict)
         await self.coordinator.async_request_refresh()
 
     # ------------------------------------------------------------------

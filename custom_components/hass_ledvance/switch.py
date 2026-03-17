@@ -127,19 +127,17 @@ class LedvanceTuyaSwitch(_LedvanceDeviceMixin, SwitchEntity):
     async def async_turn_on(self, **kwargs: Any) -> None:
         if self._switch_dps is None:
             return
-        await async_send_command(
-            self.hass, self.coordinator.api, self._device_data,
-            {self._switch_dps: True},
-        )
+        dps = {self._switch_dps: True}
+        await async_send_command(self.hass, self.coordinator.api, self._device_data, dps)
+        self.coordinator.async_optimistic_update(self._device_id, dps)
         await self.coordinator.async_request_refresh()
 
     async def async_turn_off(self, **kwargs: Any) -> None:
         if self._switch_dps is None:
             return
-        await async_send_command(
-            self.hass, self.coordinator.api, self._device_data,
-            {self._switch_dps: False},
-        )
+        dps = {self._switch_dps: False}
+        await async_send_command(self.hass, self.coordinator.api, self._device_data, dps)
+        self.coordinator.async_optimistic_update(self._device_id, dps)
         await self.coordinator.async_request_refresh()
 
 
@@ -176,19 +174,17 @@ class LedvanceTuyaOutlet(_LedvanceDeviceMixin, SwitchEntity):
     async def async_turn_on(self, **kwargs: Any) -> None:
         if self._switch_dps is None:
             return
-        await async_send_command(
-            self.hass, self.coordinator.api, self._device_data,
-            {self._switch_dps: True},
-        )
+        dps = {self._switch_dps: True}
+        await async_send_command(self.hass, self.coordinator.api, self._device_data, dps)
+        self.coordinator.async_optimistic_update(self._device_id, dps)
         await self.coordinator.async_request_refresh()
 
     async def async_turn_off(self, **kwargs: Any) -> None:
         if self._switch_dps is None:
             return
-        await async_send_command(
-            self.hass, self.coordinator.api, self._device_data,
-            {self._switch_dps: False},
-        )
+        dps = {self._switch_dps: False}
+        await async_send_command(self.hass, self.coordinator.api, self._device_data, dps)
+        self.coordinator.async_optimistic_update(self._device_id, dps)
         await self.coordinator.async_request_refresh()
 
 
@@ -223,17 +219,15 @@ class LedvanceTuyaChildLock(_LedvanceDeviceMixin, SwitchEntity):
     async def async_turn_on(self, **kwargs: Any) -> None:
         if self._lock_dps is None:
             return
-        await async_send_command(
-            self.hass, self.coordinator.api, self._device_data,
-            {self._lock_dps: True},
-        )
+        dps = {self._lock_dps: True}
+        await async_send_command(self.hass, self.coordinator.api, self._device_data, dps)
+        self.coordinator.async_optimistic_update(self._device_id, dps)
         await self.coordinator.async_request_refresh()
 
     async def async_turn_off(self, **kwargs: Any) -> None:
         if self._lock_dps is None:
             return
-        await async_send_command(
-            self.hass, self.coordinator.api, self._device_data,
-            {self._lock_dps: False},
-        )
+        dps = {self._lock_dps: False}
+        await async_send_command(self.hass, self.coordinator.api, self._device_data, dps)
+        self.coordinator.async_optimistic_update(self._device_id, dps)
         await self.coordinator.async_request_refresh()

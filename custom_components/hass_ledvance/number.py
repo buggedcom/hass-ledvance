@@ -111,10 +111,12 @@ class LedvanceTuyaCountdown(CoordinatorEntity[LedvanceTuyaCoordinator], NumberEn
     async def async_set_native_value(self, value: float) -> None:
         if self._dps is None:
             return
+        dps = {self._dps: int(value)}
         await async_send_command(
             self.hass,
             self.coordinator.api,
             self._device_data,
-            {self._dps: int(value)},
+            dps,
         )
+        self.coordinator.async_optimistic_update(self._device_id, dps)
         await self.coordinator.async_request_refresh()

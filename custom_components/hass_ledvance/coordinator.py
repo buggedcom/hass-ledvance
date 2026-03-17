@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import logging
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import timedelta
 
 from homeassistant.core import HomeAssistant
@@ -90,6 +90,20 @@ class LedvanceTuyaCoordinator(DataUpdateCoordinator[DevicesData]):
                 dev_data.version = self._lan_cache[dev_id].get("version")
 
         return devices_data
+
+    def async_optimistic_update(self, device_id: str, dps_patch: dict) -> None:
+        """Immediately apply a DPS patch to the cached data without a network round-trip.
+
+        Call this right after sending a command so the UI reflects the intended
+        state instantly, avoiding the flicker that would otherwise occur while
+        waiting for the next coordinator poll to return the new device state.
+        The next real poll will confirm (or correct) the value.
+        """
+        if self.data is None or device_id not in self.data:
+            return
+        dev = self.data[device_id]
+        patched = replace(dev, dps={**dev.dps, **dps_patch})
+        self.async_set_updated_data({**self.data, device_id: patched})
 
     def _fetch_all_devices(self) -> DevicesData:
         """Synchronous: fetch all devices from all groups."""
