@@ -35,7 +35,7 @@ from .const import (
     DPS_CUR_VOLTAGE,
     DPS_TOTAL_ENERGY,
 )
-from .coordinator import CoordinatorDeviceData, LedvanceTuyaCoordinator
+from .coordinator import CoordinatorDeviceData, LedvanceTuyaCoordinator, build_device_info
 from .schema_parser import get_numeric_scale
 
 _LOGGER = logging.getLogger(__name__)
@@ -52,25 +52,20 @@ class LedvanceDiagSensorDescription(SensorEntityDescription):
 
 
 DIAG_SENSOR_DESCRIPTIONS: tuple[LedvanceDiagSensorDescription, ...] = (
+    # Device ID, MAC and firmware version are now surfaced in the HA device info
+    # panel (serial number, connections, sw_version) — no need to duplicate here.
     LedvanceDiagSensorDescription(
-        key="device_id",
-        name="Device ID",
+        key="lan_ip_address",
+        name="LAN IP Address",
         entity_category=EntityCategory.DIAGNOSTIC,
-        entity_registry_enabled_default=False,
-        value_fn=lambda d: d.device_id,
+        value_fn=lambda d: d.lan_ip,
     ),
     LedvanceDiagSensorDescription(
-        key="ip_address",
-        name="IP Address",
+        key="cloud_ip_address",
+        name="Cloud IP Address",
         entity_category=EntityCategory.DIAGNOSTIC,
+        entity_registry_enabled_default=False,
         value_fn=lambda d: d.ip,
-    ),
-    LedvanceDiagSensorDescription(
-        key="mac_address",
-        name="MAC Address",
-        entity_category=EntityCategory.DIAGNOSTIC,
-        entity_registry_enabled_default=False,
-        value_fn=lambda d: d.mac or None,
     ),
     LedvanceDiagSensorDescription(
         key="local_key",
@@ -80,10 +75,9 @@ DIAG_SENSOR_DESCRIPTIONS: tuple[LedvanceDiagSensorDescription, ...] = (
         value_fn=lambda d: d.local_key or None,
     ),
     LedvanceDiagSensorDescription(
-        key="firmware_version",
-        name="Firmware Version",
+        key="protocol_version",
+        name="Protocol Version",
         entity_category=EntityCategory.DIAGNOSTIC,
-        entity_registry_enabled_default=False,
         value_fn=lambda d: d.version,
     ),
 )
@@ -162,8 +156,8 @@ async def async_setup_entry(
         for desc in DIAG_SENSOR_DESCRIPTIONS:
             entities.append(LedvanceDiagSensor(coordinator, entry, dev_id, desc))
 
-        # Power monitoring sensors only for socket strip devices
-        if dev.device_type == "socket_strip":
+        # Power monitoring sensors for socket strips and smart plugs with power DPS
+        if dev.device_type in ("socket_strip", "switch"):
             dps_codes_in_schema = {item.get("code") for item in dev.schema}
             for desc in POWER_SENSOR_DESCRIPTIONS:
                 if desc.dps_code in dps_codes_in_schema:
@@ -195,12 +189,7 @@ class LedvanceDiagSensor(CoordinatorEntity[LedvanceTuyaCoordinator], SensorEntit
         self._device_id = device_id
         self.entity_description = description
         self._attr_unique_id = f"{entry.entry_id}_{device_id}_{description.key}"
-        dev = coordinator.data[device_id]
-        self._attr_device_info = {
-            "identifiers": {(DOMAIN, device_id)},
-            "name": dev.name,
-            "manufacturer": "Ledvance / Tuya",
-        }
+        self._attr_device_info = build_device_info(coordinator.data[device_id])
 
     @property
     def _device_data(self) -> CoordinatorDeviceData:
@@ -230,11 +219,7 @@ class LedvancePowerSensor(CoordinatorEntity[LedvanceTuyaCoordinator], SensorEnti
         self._attr_unique_id = f"{entry.entry_id}_{device_id}_{description.key}"
 
         dev = coordinator.data[device_id]
-        self._attr_device_info = {
-            "identifiers": {(DOMAIN, device_id)},
-            "name": dev.name,
-            "manufacturer": "Ledvance / Tuya",
-        }
+        self._attr_device_info = build_device_info(dev)
         self._dps: str | None = dev.dps_map.get(description.dps_code)
 
         # Prefer the scale from the device schema; fall back to the description default

@@ -18,9 +18,9 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import DOMAIN, DPS_CHILD_LOCK
-from .coordinator import CoordinatorDeviceData, LedvanceTuyaCoordinator
+from .coordinator import CoordinatorDeviceData, LedvanceTuyaCoordinator, build_device_info
 from .local_control import async_send_command
-from .schema_parser import get_socket_outlet_dps
+from .schema_parser import get_socket_outlet_dps, has_hardware_master
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -39,11 +39,27 @@ async def async_setup_entry(
             entities.append(LedvanceTuyaSwitch(coordinator, entry, dev_id))
 
         elif dev.device_type == "socket_strip":
-            # One switch per outlet / USB port / master
-            for dps_code, label in get_socket_outlet_dps(dev.schema):
+            outlet_entries = get_socket_outlet_dps(dev.schema)
+
+            # Collect individual outlet codes (excludes hardware master)
+            individual_codes = [
+                code for code, _ in outlet_entries
+                if code not in ("master_switch", "switch_all")
+            ]
+
+            # One switch per outlet / USB port / hardware master
+            for dps_code, label in outlet_entries:
                 entities.append(
                     LedvanceTuyaOutlet(coordinator, entry, dev_id, dps_code, label)
                 )
+
+            # Synthesised master — only when there is no hardware master DPS
+            # and there are at least two individual outlets to control
+            if not has_hardware_master(dev.schema) and len(individual_codes) > 1:
+                entities.append(
+                    LedvanceTuyaMasterSwitch(coordinator, entry, dev_id, individual_codes)
+                )
+
             # Child lock (if device supports it)
             if any(item.get("code") == DPS_CHILD_LOCK for item in dev.schema):
                 entities.append(LedvanceTuyaChildLock(coordinator, entry, dev_id))
@@ -70,12 +86,7 @@ class _LedvanceDeviceMixin(CoordinatorEntity[LedvanceTuyaCoordinator]):
         super().__init__(coordinator)
         self._device_id = device_id
         self._entry = entry
-        dev = coordinator.data[device_id]
-        self._attr_device_info = {
-            "identifiers": {(DOMAIN, device_id)},
-            "name": dev.name,
-            "manufacturer": "Ledvance / Tuya",
-        }
+        self._attr_device_info = build_device_info(coordinator.data[device_id])
 
     @property
     def _device_data(self) -> CoordinatorDeviceData:
@@ -184,6 +195,59 @@ class LedvanceTuyaOutlet(_LedvanceDeviceMixin, SwitchEntity):
             return
         dps = {self._switch_dps: False}
         await async_send_command(self.hass, self.coordinator.api, self._device_data, dps)
+        self.coordinator.async_optimistic_update(self._device_id, dps)
+        await self.coordinator.async_request_refresh()
+
+
+# ---------------------------------------------------------------------------
+# Synthesised master switch (no hardware master_switch / switch_all DPS)
+# ---------------------------------------------------------------------------
+
+class LedvanceTuyaMasterSwitch(_LedvanceDeviceMixin, SwitchEntity):
+    """Synthetic 'All Outlets' switch for strips without a hardware master DPS.
+
+    State:  ON when *any* individual outlet is on; OFF when *all* are off.
+    Action: sends a single command dict setting every individual outlet DPS
+            to the requested state, so all outlets change in one round-trip.
+    """
+
+    _attr_name = "All Outlets"
+    _attr_device_class = SwitchDeviceClass.OUTLET
+
+    def __init__(
+        self,
+        coordinator: LedvanceTuyaCoordinator,
+        entry: ConfigEntry,
+        device_id: str,
+        outlet_dps_codes: list[str],
+    ) -> None:
+        super().__init__(coordinator, entry, device_id)
+        self._outlet_dps_codes = outlet_dps_codes
+        self._attr_unique_id = f"{entry.entry_id}_{device_id}_master_synthetic"
+
+    @property
+    def is_on(self) -> bool | None:
+        dev = self._device_data
+        if dev.dps is None:
+            return None
+        return any(
+            dev.dps.get(dev.dps_map.get(code)) for code in self._outlet_dps_codes
+        )
+
+    async def async_turn_on(self, **kwargs: Any) -> None:
+        await self._send_all(True)
+
+    async def async_turn_off(self, **kwargs: Any) -> None:
+        await self._send_all(False)
+
+    async def _send_all(self, state: bool) -> None:
+        dev = self._device_data
+        dps = {
+            dev.dps_map[code]: state
+            for code in self._outlet_dps_codes
+            if code in dev.dps_map
+        }
+        await async_send_command(self.hass, self.coordinator.api, dev, dps)
         self.coordinator.async_optimistic_update(self._device_id, dps)
         await self.coordinator.async_request_refresh()
 

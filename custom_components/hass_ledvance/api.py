@@ -44,6 +44,9 @@ class DeviceInfo:
     mac: str
     schema: list       # parsed schema list
     dps: dict          # current DPS state dict (str keys)
+    ip: str | None = None        # local IP reported by cloud (localIp field) — usually WAN
+    version: str | None = None  # Tuya protocol version (pv field, e.g. "3.3") — used by tinytuya
+    fw_version: str | None = None  # firmware/base version (bv field, e.g. "40") — display only
     room_name: str = ""  # Tuya room/area name; empty if unknown
 
 
@@ -354,6 +357,9 @@ class TuyaAPI:
             mac=raw.get("mac", ""),
             schema=schema,
             dps=dps,
+            ip=raw.get("localIp") or raw.get("ip") or None,
+            version=str(raw["pv"]) if raw.get("pv") else None,
+            fw_version=str(raw["bv"]) if raw.get("bv") else None,
         )
 
     def get_dps(self, device_id: str) -> dict:

@@ -7,6 +7,7 @@ from typing import Any
 from homeassistant.components.light import (
     ATTR_BRIGHTNESS,
     ATTR_COLOR_TEMP_KELVIN,
+    ATTR_EFFECT,
     ATTR_HS_COLOR,
     ColorMode,
     LightEntity,
@@ -27,6 +28,8 @@ from .const import (
     DPS_BRIGHT_VALUE_V2,
     DPS_COLOUR_DATA,
     DPS_COLOUR_DATA_V2,
+    DPS_SCENE_DATA,
+    DPS_SCENE_DATA_V2,
     DPS_SWITCH_LED,
     DPS_TEMP_VALUE,
     DPS_WORK_MODE,
@@ -37,9 +40,12 @@ from .const import (
     TUYA_COLOUR_TEMP_MAX,
     TUYA_COLOUR_TEMP_MIN,
 )
-from .coordinator import CoordinatorDeviceData, LedvanceTuyaCoordinator
+from .coordinator import CoordinatorDeviceData, LedvanceTuyaCoordinator, build_device_info
 from .local_control import async_send_command
-from .schema_parser import get_integer_range
+from .schema_parser import get_enum_range, get_integer_range
+
+# work_mode values that map to HA colour modes rather than effects
+_COLOUR_WORK_MODES = {"white", "colour"}
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -78,11 +84,7 @@ class LedvanceTuyaLight(CoordinatorEntity[LedvanceTuyaCoordinator], LightEntity)
         self._attr_unique_id = f"{entry.entry_id}_{device_id}"
 
         dev = self._device_data
-        self._attr_device_info = {
-            "identifiers": {(DOMAIN, device_id)},
-            "name": dev.name,
-            "manufacturer": "Ledvance / Tuya",
-        }
+        self._attr_device_info = build_device_info(dev)
 
         # Determine supported colour modes from schema
         codes = {item.get("code") for item in dev.schema}
@@ -123,6 +125,17 @@ class LedvanceTuyaLight(CoordinatorEntity[LedvanceTuyaCoordinator], LightEntity)
 
         self._attr_min_color_temp_kelvin = HA_COLOUR_TEMP_MIN_KELVIN
         self._attr_max_color_temp_kelvin = HA_COLOUR_TEMP_MAX_KELVIN
+
+        # Scene / effect support
+        self._scene_dps = dev.dps_map.get(DPS_SCENE_DATA) or dev.dps_map.get(DPS_SCENE_DATA_V2)
+        work_mode_values = get_enum_range(dev.schema, DPS_WORK_MODE)
+        effect_modes = [m for m in work_mode_values if m not in _COLOUR_WORK_MODES]
+        if effect_modes:
+            self._effect_modes: list[str] = effect_modes
+            self._attr_effect_list = effect_modes
+            self._attr_supported_features = LightEntityFeature.EFFECT
+        else:
+            self._effect_modes = []
 
     # ------------------------------------------------------------------
 
@@ -172,6 +185,14 @@ class LedvanceTuyaLight(CoordinatorEntity[LedvanceTuyaCoordinator], LightEntity)
         return self._parse_colour_data(str(raw))
 
     @property
+    def effect(self) -> str | None:
+        """Return the active effect (scene/music mode), or None."""
+        if not self._effect_modes or self._mode_dps is None:
+            return None
+        mode = self._device_data.dps.get(self._mode_dps)
+        return mode if mode in self._effect_modes else None
+
+    @property
     def color_mode(self) -> ColorMode:
         """Return current colour mode based on work_mode DPS."""
         if self._mode_dps is None:
@@ -208,6 +229,11 @@ class LedvanceTuyaLight(CoordinatorEntity[LedvanceTuyaCoordinator], LightEntity)
             dps_dict[self._colour_dps] = self._encode_colour_data(kwargs[ATTR_HS_COLOR])
             if self._mode_dps:
                 dps_dict[self._mode_dps] = "colour"
+
+        if ATTR_EFFECT in kwargs and self._mode_dps:
+            effect = kwargs[ATTR_EFFECT]
+            if effect in self._effect_modes:
+                dps_dict[self._mode_dps] = effect
 
         await async_send_command(
             self.hass, self.coordinator.api, self._device_data, dps_dict

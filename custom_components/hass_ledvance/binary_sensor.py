@@ -33,7 +33,7 @@ from .const import (
     FAULT_OVERTEMP_BIT,
     FAULT_OVERVOLTAGE_BIT,
 )
-from .coordinator import CoordinatorDeviceData, LedvanceTuyaCoordinator
+from .coordinator import CoordinatorDeviceData, LedvanceTuyaCoordinator, build_device_info
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -191,12 +191,7 @@ class LedvanceTuyaOnlineSensor(CoordinatorEntity[LedvanceTuyaCoordinator], Binar
         super().__init__(coordinator)
         self._device_id = device_id
         self._attr_unique_id = f"{entry.entry_id}_{device_id}_online"
-        dev = coordinator.data[device_id]
-        self._attr_device_info = {
-            "identifiers": {(DOMAIN, device_id)},
-            "name": dev.name,
-            "manufacturer": "Ledvance / Tuya",
-        }
+        self._attr_device_info = build_device_info(coordinator.data[device_id])
 
     @property
     def _device_data(self) -> CoordinatorDeviceData:
@@ -224,12 +219,7 @@ class LedvanceAlarmSensor(CoordinatorEntity[LedvanceTuyaCoordinator], BinarySens
         self._device_id = device_id
         self.entity_description = description
         self._attr_unique_id = f"{entry.entry_id}_{device_id}_{description.key}"
-        dev = coordinator.data[device_id]
-        self._attr_device_info = {
-            "identifiers": {(DOMAIN, device_id)},
-            "name": dev.name,
-            "manufacturer": "Ledvance / Tuya",
-        }
+        self._attr_device_info = build_device_info(coordinator.data[device_id])
 
     @property
     def _device_data(self) -> CoordinatorDeviceData:

@@ -1,6 +1,7 @@
 """Ledvance / Tuya Home Assistant integration."""
 from __future__ import annotations
 
+import difflib
 import logging
 
 from homeassistant.config_entries import ConfigEntry
@@ -77,7 +78,51 @@ async def async_setup_entry(hass: HomeAssistant, entry: LedvanceTuyaConfigEntry)
     # Must run after platform setup so device-registry entries exist.
     await _async_assign_areas(hass, coordinator)
 
+    # Re-run area matching on every coordinator update so that if a device's
+    # Tuya room assignment changes it is reflected in HA automatically.
+    # The guard inside _async_assign_areas skips devices that are already correct.
+    def _on_coordinator_update() -> None:
+        hass.async_create_task(_async_assign_areas(hass, coordinator))
+
+    entry.async_on_unload(coordinator.async_add_listener(_on_coordinator_update))
+
     return True
+
+
+def _find_best_area(room_name: str, area_by_name: dict[str, str]) -> tuple[str | None, str, float]:
+    """Return (area_id, matched_name, score) for the closest HA area to a Tuya room name.
+
+    Strategy (highest confidence first):
+      1. Exact case-insensitive match         → score 1.0
+      2. One name is a substring of the other → score 0.8
+         (e.g. Tuya "Office" ↔ HA "Office Main")
+      3. difflib fuzzy similarity ≥ 0.5       → score = ratio
+    Returns (None, "", 0.0) when no match is good enough.
+    """
+    lower = room_name.lower()
+    candidates = list(area_by_name.keys())
+
+    # 1. Exact match
+    if lower in area_by_name:
+        return area_by_name[lower], lower, 1.0
+
+    # 2. Substring containment — pick the candidate with the highest similarity
+    #    among those that fully contain or are fully contained by the room name.
+    subset = [c for c in candidates if lower in c or c in lower]
+    if subset:
+        best = max(subset, key=lambda c: difflib.SequenceMatcher(None, lower, c).ratio())
+        return area_by_name[best], best, 0.8
+
+    # 3. Fuzzy similarity across all candidates
+    scored = sorted(
+        ((difflib.SequenceMatcher(None, lower, c).ratio(), c) for c in candidates),
+        reverse=True,
+    )
+    if scored and scored[0][0] >= 0.5:
+        score, best = scored[0]
+        return area_by_name[best], best, round(score, 2)
+
+    return None, "", 0.0
 
 
 async def _async_assign_areas(
@@ -86,9 +131,8 @@ async def _async_assign_areas(
 ) -> None:
     """Match Tuya room names to existing HA areas and assign devices.
 
-    Only assigns devices when an HA area already exists whose name matches
-    the Tuya room name (case-insensitive). Devices with no room name, or
-    whose room name has no match, are left unchanged.
+    Uses a tiered matching strategy: exact → substring → fuzzy (≥ 0.5 similarity).
+    Devices with no room name, or with no plausible area match, are left unchanged.
     """
     area_reg = ar.async_get(hass)
     device_reg = dr.async_get(hass)
@@ -103,10 +147,11 @@ async def _async_assign_areas(
         if not dev_data.room_name:
             continue
 
-        area_id = area_by_name.get(dev_data.room_name.lower())
+        area_id, matched_name, score = _find_best_area(dev_data.room_name, area_by_name)
+
         if area_id is None:
             _LOGGER.debug(
-                "Tuya room '%s' for device '%s' has no matching HA area — skipping",
+                "No area match for Tuya room '%s' (device '%s') — skipping",
                 dev_data.room_name,
                 dev_data.name,
             )
@@ -120,14 +165,19 @@ async def _async_assign_areas(
         if device_entry.area_id != area_id:
             device_reg.async_update_device(device_entry.id, area_id=area_id)
             _LOGGER.debug(
-                "Assigned device '%s' → area '%s'",
+                "Assigned device '%s' → area '%s' (matched Tuya room '%s', score %.2f)",
                 dev_data.name,
+                matched_name,
                 dev_data.room_name,
+                score,
             )
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: LedvanceTuyaConfigEntry) -> bool:
     """Unload a config entry."""
+    coordinator: LedvanceTuyaCoordinator = hass.data[DOMAIN].get(entry.entry_id)
+    if coordinator:
+        await coordinator.async_shutdown()
     unloaded = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
     if unloaded:
         hass.data[DOMAIN].pop(entry.entry_id, None)

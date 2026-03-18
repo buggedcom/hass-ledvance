@@ -39,6 +39,8 @@ DPS_BRIGHT_VALUE_V2 = "bright_value_v2"
 DPS_TEMP_VALUE = "temp_value"
 DPS_COLOUR_DATA = "colour_data"
 DPS_COLOUR_DATA_V2 = "colour_data_v2"
+DPS_SCENE_DATA = "scene_data"
+DPS_SCENE_DATA_V2 = "scene_data_v2"
 
 # Light: Tuya value ranges
 TUYA_BRIGHTNESS_MIN = 10

@@ -15,14 +15,6 @@ _LIGHT_CODES = frozenset({
     "work_mode",
 })
 
-# DPS codes that indicate a socket strip (power strip / extension socket)
-_SOCKET_STRIP_CODES = frozenset({
-    "cur_current",
-    "cur_power",
-    "cur_voltage",
-    "total_forward_energy",
-})
-
 
 def detect_device_type(schema: list[dict], product_id: str) -> str:
     """Return 'light', 'socket_strip', 'switch', or 'unknown' for a device.
@@ -37,9 +29,10 @@ def detect_device_type(schema: list[dict], product_id: str) -> str:
     if codes & _LIGHT_CODES:
         return "light"
 
-    # Socket strip: multiple numbered outlets OR power monitoring DPS present
+    # Socket strip: requires multiple numbered outlets (switch_1, switch_2, …)
+    # A single smart plug with power monitoring DPS is still just a "switch".
     numbered_switches = [c for c in codes if c.startswith("switch_") and c[7:].isdigit()]
-    if len(numbered_switches) > 1 or (codes & _SOCKET_STRIP_CODES):
+    if len(numbered_switches) > 1:
         return "socket_strip"
 
     # Single switch device
@@ -108,6 +101,20 @@ def get_numeric_scale(schema: list[dict], code: str) -> float:
         return 1.0
 
 
+def get_enum_range(schema: list[dict], code: str) -> list[str]:
+    """Return list of valid enum values for an Enum-type DPS, or []."""
+    item = get_schema_property(schema, code)
+    if item is None:
+        return []
+    try:
+        prop = item.get("property", {})
+        if isinstance(prop, str):
+            prop = json.loads(prop)
+        return list(prop.get("range", []))
+    except (ValueError, TypeError):
+        return []
+
+
 def get_socket_outlet_dps(schema: list[dict]) -> list[tuple[str, str]]:
     """Return [(dps_code, label), ...] for every controllable outlet on a socket strip.
 
@@ -140,3 +147,9 @@ def get_socket_outlet_dps(schema: list[dict]) -> list[tuple[str, str]]:
             break
 
     return result
+
+
+def has_hardware_master(schema: list[dict]) -> bool:
+    """Return True if the schema contains a hardware master-switch DPS code."""
+    codes = {item.get("code") for item in schema}
+    return bool(codes & {"master_switch", "switch_all"})

@@ -16,7 +16,7 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import DOMAIN, DPS_COUNTDOWN_PREFIX
-from .coordinator import CoordinatorDeviceData, LedvanceTuyaCoordinator
+from .coordinator import CoordinatorDeviceData, LedvanceTuyaCoordinator, build_device_info
 from .local_control import async_send_command
 from .schema_parser import get_integer_range
 
@@ -84,11 +84,7 @@ class LedvanceTuyaCountdown(CoordinatorEntity[LedvanceTuyaCoordinator], NumberEn
         self._attr_unique_id = f"{entry.entry_id}_{device_id}_{dps_code}"
 
         dev = coordinator.data[device_id]
-        self._attr_device_info = {
-            "identifiers": {(DOMAIN, device_id)},
-            "name": dev.name,
-            "manufacturer": "Ledvance / Tuya",
-        }
+        self._attr_device_info = build_device_info(dev)
         self._dps: str | None = dev.dps_map.get(dps_code)
 
         lo, hi = get_integer_range(dev.schema, dps_code)

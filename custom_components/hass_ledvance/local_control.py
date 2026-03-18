@@ -24,12 +24,12 @@ async def async_send_command(
     dps_dict uses DPS number strings as keys, e.g. {"1": True, "3": 500}.
     Returns True if the command was accepted.
     """
-    if device.ip and device.local_key and device.version:
+    if device.lan_ip and device.local_key and device.version:
         try:
             success = await hass.async_add_executor_job(
                 _send_local,
                 device.device_id,
-                device.ip,
+                device.lan_ip,
                 device.local_key,
                 device.version,
                 dps_dict,
@@ -38,7 +38,7 @@ async def async_send_command(
                 _LOGGER.debug(
                     "Local command sent to %s (%s): %s",
                     device.name,
-                    device.ip,
+                    device.lan_ip,
                     dps_dict,
                 )
                 return True
@@ -49,7 +49,7 @@ async def async_send_command(
             _LOGGER.debug(
                 "Local control error for %s (%s): %s — falling back to cloud",
                 device.name,
-                device.ip,
+                device.lan_ip,
                 exc,
             )
 
