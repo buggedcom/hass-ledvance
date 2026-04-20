@@ -27,6 +27,7 @@ _LOGGER = logging.getLogger(__name__)
 
 API_VERSION_FOR_ACTION: dict[str, str] = {
     "tuya.m.device.sub.list": "1.1",
+    "tuya.m.location.room.list": "1.1",
 }
 DEFAULT_API_VERSION = "1.0"
 
@@ -137,7 +138,9 @@ class TuyaAPI:
                 response = self.session.post(
                     self._endpoint, params=params, data=data, headers=headers, timeout=15
                 )
-                result = self._handle(response.json())
+                result = self._handle(
+                    response.json(), options.get("action", ""), api_version
+                )
                 _LOGGER.debug("API %s → %s", options.get("action"), result)
                 return result
             except TooManyRequests:
@@ -191,7 +194,7 @@ class TuyaAPI:
         prehash = hashlib.md5(data.encode("utf-8")).hexdigest()
         return prehash[8:16] + prehash[0:8] + prehash[24:32] + prehash[16:24]
 
-    def _handle(self, result: dict) -> dict | list:
+    def _handle(self, result: dict, action: str = "", api_version: str = "") -> dict | list:
         if result.get("success"):
             return result["result"]
         error_code = result.get("errorCode", "")
@@ -201,7 +204,10 @@ class TuyaAPI:
             raise InvalidAuthentication
         if error_code == "REQUEST_TOO_FREQUENTLY_PLEASE_TRY_AGAIN_LATER":
             raise TooManyRequests(result.get("errorMsg", "Rate limited"))
-        _LOGGER.error("API error %s: %s", error_code, result.get("errorMsg"))
+        _LOGGER.error(
+            "API error %s: %s (action=%s v=%s)",
+            error_code, result.get("errorMsg"), action, api_version,
+        )
         raise ValueError(f"API error: {error_code} — {result.get('errorMsg')}")
 
     def _enc_password(self, public_key: str, exponent: str, password: str) -> str:
