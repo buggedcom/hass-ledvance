@@ -27,7 +27,7 @@ _LOGGER = logging.getLogger(__name__)
 
 API_VERSION_FOR_ACTION: dict[str, str] = {
     "tuya.m.device.sub.list": "1.1",
-    "tuya.m.location.room.list": "1.1",
+    "tuya.m.location.room.list": "2.0",
 }
 DEFAULT_API_VERSION = "1.0"
 
