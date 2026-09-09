@@ -29,9 +29,11 @@ class _FakeDevice:
 # ---------------------------------------------------------------------------
 
 def _make_tinytuya_mock(success: bool = True):
-    """Return a mock tinytuya module whose OutletDevice.set_status behaves as requested."""
+    """Return a mock tinytuya module whose set_multiple_values behaves as requested."""
     device_mock = MagicMock()
-    device_mock.set_status.return_value = {} if success else {"Error": "timeout"}
+    device_mock.set_multiple_values.return_value = (
+        {} if success else {"Error": "timeout"}
+    )
     tinytuya_mock = MagicMock()
     tinytuya_mock.OutletDevice.return_value = device_mock
     return tinytuya_mock, device_mock
