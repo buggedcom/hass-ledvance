@@ -29,9 +29,11 @@ class _FakeDevice:
 # ---------------------------------------------------------------------------
 
 def _make_tinytuya_mock(success: bool = True):
-    """Return a mock tinytuya module whose OutletDevice.set_status behaves as requested."""
+    """Return a mock tinytuya module whose set_multiple_values behaves as requested."""
     device_mock = MagicMock()
-    device_mock.set_status.return_value = {} if success else {"Error": "timeout"}
+    device_mock.set_multiple_values.return_value = (
+        {} if success else {"Error": "timeout"}
+    )
     tinytuya_mock = MagicMock()
     tinytuya_mock.OutletDevice.return_value = device_mock
     return tinytuya_mock, device_mock
@@ -59,7 +61,26 @@ class TestLocalControlSuccess:
             await async_send_command(hass, mock_api, device, {"1": True})
 
         mock_api.set_dps.assert_not_called()
+        
+    async def test_sends_dps_with_set_multiple_values(self, hass, mock_api):
+        device = _FakeDevice(
+            lan_ip="192.168.1.50",
+            local_key="abc",
+            version="3.3",
+        )
+        tinytuya_mock, device_mock = _make_tinytuya_mock(success=True)
+        dps = {"20": True, "51": "AAcBJgJOAG4AjABG"}
 
+        with patch.dict("sys.modules", {"tinytuya": tinytuya_mock}):
+            result = await async_send_command(hass, mock_api, device, dps)
+
+        assert result is True
+        device_mock.set_multiple_values.assert_called_once_with(
+            dps,
+            nowait=False,
+        )
+        device_mock.set_status.assert_not_called()
+        
     async def test_sets_correct_socket_timeout(self, hass, mock_api):
         device = _FakeDevice(lan_ip="192.168.1.50", local_key="abc", version="3.3")
         tinytuya_mock, device_mock = _make_tinytuya_mock(success=True)
