@@ -1,4 +1,5 @@
 """Ledvance / Tuya Home Assistant integration."""
+
 from __future__ import annotations
 
 import difflib
@@ -6,28 +7,30 @@ import logging
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_EMAIL, CONF_PASSWORD
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
 from homeassistant.helpers import area_registry as ar
 from homeassistant.helpers import device_registry as dr
+from homeassistant.helpers import entity_registry as er
+from homeassistant.helpers import issue_registry as ir
 
 from .api import TuyaAPI
-from .const import CONF_REGION, DOMAIN, PLATFORMS, REGIONS
+from .const import CONF_REGION, DOMAIN, PLATFORMS
 from .coordinator import LedvanceTuyaCoordinator
-from .exceptions import CannotConnect, InvalidAuthentication, TooManyRequests
+from .exceptions import CannotConnect, InvalidAuthentication, InvalidUserSession, TooManyRequests
 
 _LOGGER = logging.getLogger(__name__)
 
 # Internal keys used to cache Tuya tokens across restarts
 _CONF_SID = "_sid"
 _CONF_REFRESH_TOKEN = "_refresh_token"
+_CONF_AUTO_AREAS = "_auto_area_assignments"
 
 type LedvanceTuyaConfigEntry = ConfigEntry[LedvanceTuyaCoordinator]
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: LedvanceTuyaConfigEntry) -> bool:
     """Set up Ledvance/Tuya from a config entry."""
-    region_cfg = REGIONS[entry.data[CONF_REGION]]
 
     def _persist_tokens(new_sid: str, new_refresh: str) -> None:
         """Persist freshly obtained tokens into the config entry (thread-safe)."""
@@ -39,11 +42,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: LedvanceTuyaConfigEntry)
         )
         _LOGGER.debug("Persisted new SID and refresh token")
 
-    api = TuyaAPI(
-        email=entry.data[CONF_EMAIL],
-        password=entry.data[CONF_PASSWORD],
-        endpoint=region_cfg["endpoint"],
-        country_code=region_cfg["country_code"],
+    api = TuyaAPI.for_region(
+        entry.data[CONF_REGION],
+        entry.data[CONF_EMAIL],
+        entry.data[CONF_PASSWORD],
         on_tokens_updated=_persist_tokens,
     )
 
@@ -53,18 +55,19 @@ async def async_setup_entry(hass: HomeAssistant, entry: LedvanceTuyaConfigEntry)
     if cached_sid:
         api.sid = cached_sid
         api.refresh_token = cached_refresh
-        _LOGGER.debug("Restored cached SID%s, skipping login",
-                      " and refresh token" if cached_refresh else "")
+        _LOGGER.debug(
+            "Restored cached SID%s, skipping login", " and refresh token" if cached_refresh else ""
+        )
     else:
         # No cached SID — must authenticate now (will send push notification)
         try:
             await hass.async_add_executor_job(api.login)
-        except InvalidAuthentication as exc:
+        except (InvalidAuthentication, InvalidUserSession) as exc:
             raise ConfigEntryAuthFailed("Invalid credentials") from exc
         except (CannotConnect, TooManyRequests) as exc:
             raise ConfigEntryNotReady("Cannot connect to Tuya cloud") from exc
 
-    coordinator = LedvanceTuyaCoordinator(hass, api)
+    coordinator = LedvanceTuyaCoordinator(hass, api, entry)
 
     # First refresh — raises ConfigEntryNotReady on failure
     await coordinator.async_config_entry_first_refresh()
@@ -74,18 +77,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: LedvanceTuyaConfigEntry)
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
-    # Best-effort: assign HA areas that match Tuya room names.
-    # Must run after platform setup so device-registry entries exist.
-    await _async_assign_areas(hass, coordinator)
+    @callback
+    def assign_areas() -> None:
+        _async_assign_areas(hass, coordinator, entry)
 
-    # Re-run area matching on every coordinator update so that if a device's
-    # Tuya room assignment changes it is reflected in HA automatically.
-    # The guard inside _async_assign_areas skips devices that are already correct.
-    def _on_coordinator_update() -> None:
-        hass.async_create_task(_async_assign_areas(hass, coordinator))
-
-    entry.async_on_unload(coordinator.async_add_listener(_on_coordinator_update))
-
+    assign_areas()
+    entry.async_on_unload(coordinator.async_add_listener(assign_areas))
+    _async_report_legacy_key_sensors(hass, entry)
+    coordinator.async_start_lan_monitor()
     return True
 
 
@@ -125,9 +124,11 @@ def _find_best_area(room_name: str, area_by_name: dict[str, str]) -> tuple[str |
     return None, "", 0.0
 
 
-async def _async_assign_areas(
+@callback
+def _async_assign_areas(
     hass: HomeAssistant,
     coordinator: LedvanceTuyaCoordinator,
+    entry: LedvanceTuyaConfigEntry,
 ) -> None:
     """Match Tuya room names to existing HA areas and assign devices.
 
@@ -138,12 +139,27 @@ async def _async_assign_areas(
     device_reg = dr.async_get(hass)
 
     # Build a lowercase name → area_id lookup from the current HA area registry
-    area_by_name: dict[str, str] = {
-        area.name.lower(): area.id
-        for area in area_reg.areas.values()
-    }
+    area_by_name: dict[str, str] = {area.name.lower(): area.id for area in area_reg.areas.values()}
 
+    saved_assignments = entry.data.get(_CONF_AUTO_AREAS, {})
+    assignments = dict(saved_assignments)
+    get_device_by_identifier = getattr(device_reg, "async_get_device_by_identifier", None)
     for dev_id, dev_data in coordinator.data.items():
+        if dev_id in assignments and assignments[dev_id] is None:
+            continue
+        identifiers = (DOMAIN, dev_id)
+        device_entry = (
+            get_device_by_identifier(identifiers, entry.entry_id)
+            if get_device_by_identifier is not None
+            else device_reg.async_get_device(identifiers={identifiers})
+        )
+        if device_entry is None:
+            continue
+
+        # An explicit None keeps a manual assignment or clear across refreshes and reloads.
+        if device_entry.area_id != assignments.get(dev_id):
+            assignments[dev_id] = None
+            continue
         if not dev_data.room_name:
             continue
 
@@ -157,11 +173,6 @@ async def _async_assign_areas(
             )
             continue
 
-        device_entry = device_reg.async_get_device(identifiers={(DOMAIN, dev_id)})
-        if device_entry is None:
-            continue
-
-        # Only update if the area isn't already set to the same value
         if device_entry.area_id != area_id:
             device_reg.async_update_device(device_entry.id, area_id=area_id)
             _LOGGER.debug(
@@ -171,13 +182,40 @@ async def _async_assign_areas(
                 dev_data.room_name,
                 score,
             )
+        assignments[dev_id] = area_id
+
+    if assignments != saved_assignments:
+        hass.config_entries.async_update_entry(entry, data={**entry.data, _CONF_AUTO_AREAS: assignments})
+
+
+@callback
+def _async_report_legacy_key_sensors(hass: HomeAssistant, entry: LedvanceTuyaConfigEntry) -> None:
+    """Point affected upgrades to Recorder cleanup without deleting history."""
+    legacy_entities = sorted(
+        entity.entity_id
+        for entity in er.async_entries_for_config_entry(er.async_get(hass), entry.entry_id)
+        if entity.platform == DOMAIN
+        and entity.domain == "sensor"
+        and entity.unique_id.endswith("_local_key")
+        and entity.disabled_by is not er.RegistryEntryDisabler.INTEGRATION
+    )
+    issue_id = f"legacy_local_key_{entry.entry_id}"
+    if legacy_entities:
+        ir.async_create_issue(
+            hass,
+            DOMAIN,
+            issue_id,
+            is_fixable=False,
+            severity=ir.IssueSeverity.WARNING,
+            translation_key="legacy_local_key",
+            translation_placeholders={"entity_ids": ", ".join(legacy_entities)},
+        )
+    else:
+        ir.async_delete_issue(hass, DOMAIN, issue_id)
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: LedvanceTuyaConfigEntry) -> bool:
     """Unload a config entry."""
-    coordinator: LedvanceTuyaCoordinator = hass.data[DOMAIN].get(entry.entry_id)
-    if coordinator:
-        await coordinator.async_shutdown()
     unloaded = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
     if unloaded:
         hass.data[DOMAIN].pop(entry.entry_id, None)

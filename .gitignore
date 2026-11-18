@@ -6,3 +6,9 @@ __pycache__/
 Thumbs.db
 node_modules/
 .env.dev
+
+.coverage
+coverage.xml
+.pytest_cache/
+.ruff_cache/
+*.egg-info/

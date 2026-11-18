@@ -1,22 +1,32 @@
 """DataUpdateCoordinator for Ledvance/Tuya devices."""
+
 from __future__ import annotations
 
 import asyncio
 import logging
 import time
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import suppress
 from dataclasses import dataclass, field, replace
 from datetime import timedelta
 
-from homeassistant.core import HomeAssistant
-from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
-
-from .api import DeviceInfo, TuyaAPI
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.core import HomeAssistant, callback
+from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.helpers.device_registry import CONNECTION_NETWORK_MAC
 from homeassistant.helpers.entity import DeviceInfo
+from homeassistant.helpers.update_coordinator import (
+    CoordinatorEntity,
+    DataUpdateCoordinator,
+    UpdateFailed,
+)
 
+from .api import DeviceInfo as TuyaDeviceInfo
+from .api import TuyaAPI
 from .const import DEFAULT_SCAN_INTERVAL, DOMAIN, LAN_SCAN_INTERVAL
-from .exceptions import CannotConnect, InvalidAuthentication, TooManyRequests
-from .schema_parser import detect_device_type, get_dps_map
+from .device_io import device_lock
+from .exceptions import CannotConnect, InvalidAuthentication, InvalidUserSession, TooManyRequests
+from .schema_parser import detect_device_type, get_dps_map, normalize_schema
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -29,18 +39,19 @@ class CoordinatorDeviceData:
     gateway_id: str
     name: str
     product_id: str
-    device_type: str          # 'light' | 'switch' | 'unknown'
-    schema: list
-    dps_map: dict[str, str]   # code → dps_number_string
-    dps: dict[str, object]    # dps_number_string → value
-    local_key: str
+    device_type: str  # 'light' | 'switch' | 'unknown'
+    schema: list[dict]
+    dps_map: dict[str, str]  # code → dps_number_string
+    dps: dict[str, object]  # dps_number_string → value
+    local_key: str = field(repr=False)
     mac: str
     is_online: bool
-    ip: str | None = None       # cloud-reported IP (typically WAN) — diagnostic only
-    lan_ip: str | None = None   # tinytuya LAN-discovered IP — used for local control
+    ip: str | None = None  # cloud-reported IP (typically WAN) — diagnostic only
+    lan_ip: str | None = None  # tinytuya LAN-discovered IP — used for local control
     version: str | None = None  # Tuya protocol version (e.g. "3.3") — used by tinytuya
     fw_version: str | None = None  # firmware/base version (e.g. "40") — shown in device panel
     room_name: str = ""  # Tuya room name; empty if unassigned
+    lan_reachable: bool = False
 
 
 # Type alias for the coordinator data dict
@@ -70,55 +81,62 @@ def build_device_info(dev: CoordinatorDeviceData) -> DeviceInfo:
 class LedvanceTuyaCoordinator(DataUpdateCoordinator[DevicesData]):
     """Polls device states — LAN-first with cloud fallback — and scans for local IPs."""
 
-    def __init__(self, hass: HomeAssistant, api: TuyaAPI) -> None:
+    def __init__(self, hass: HomeAssistant, api: TuyaAPI, entry: ConfigEntry | None = None) -> None:
         super().__init__(
             hass,
             _LOGGER,
+            config_entry=entry,
             name="Ledvance/Tuya",
             update_interval=timedelta(seconds=DEFAULT_SCAN_INTERVAL),
         )
         self.api = api
-        self._lan_cache: dict[str, dict] = {}   # device_id → {ip, version}
-        self._last_lan_scan: float = 0.0
+        self._lan_cache: dict[str, dict] = {}  # device_id → {ip, version}
+        self._last_lan_scan: float | None = None
         self._lan_monitor_task: asyncio.Task | None = None
+        self._command_locks: dict[str, asyncio.Lock] = {}
+        self._cloud_retry_after: dict[str, float] = {}
+
+    def command_lock(self, device_id: str) -> asyncio.Lock:
+        """Serialize commands, including mixed-channel read/modify/write operations."""
+        return self._command_locks.setdefault(device_id, asyncio.Lock())
 
     # ------------------------------------------------------------------
 
     async def _async_update_data(self) -> DevicesData:
         """Fetch device states — LAN-first with cloud fallback — and keep LAN cache fresh."""
-        # Refresh LAN scan when due (always on first call when cache is empty,
-        # then every LAN_SCAN_INTERVAL seconds).  Running it BEFORE the device
-        # fetch means local DPS polling is available from the very first update.
+        # Scan before the first fetch so local polling is available during setup.
         now = time.monotonic()
-        if not self._lan_cache or now - self._last_lan_scan >= LAN_SCAN_INTERVAL:
+        if self._last_lan_scan is None or now - self._last_lan_scan >= LAN_SCAN_INTERVAL:
+            self._last_lan_scan = now
             try:
-                scan_result = await self.hass.async_add_executor_job(self._scan_lan)
-                self._lan_cache = scan_result
-                self._last_lan_scan = now
-                _LOGGER.debug("LAN scan found %d devices", len(scan_result))
+                self._lan_cache = await self.hass.async_add_executor_job(self._scan_lan)
+                _LOGGER.debug("LAN scan found %d devices", len(self._lan_cache))
             except Exception as exc:  # noqa: BLE001
                 _LOGGER.warning("LAN scan failed (non-fatal): %s", exc)
 
         try:
-            devices_data = await self.hass.async_add_executor_job(
-                self._fetch_all_devices
-            )
-        except InvalidAuthentication as exc:
-            raise UpdateFailed(f"Authentication failed: {exc}") from exc
+            return await self.hass.async_add_executor_job(self._fetch_all_devices)
+        except (InvalidAuthentication, InvalidUserSession) as exc:
+            raise ConfigEntryAuthFailed("Ledvance cloud credentials have expired") from exc
         except TooManyRequests as exc:
             raise UpdateFailed(f"Tuya API rate limited — will retry next poll: {exc}") from exc
         except CannotConnect as exc:
             raise UpdateFailed(f"Cannot connect to Tuya cloud: {exc}") from exc
 
-        # Start the per-device LAN monitor after the first successful fetch.
-        if self._lan_monitor_task is None or self._lan_monitor_task.done():
-            self._lan_monitor_task = self.hass.async_create_background_task(
-                self._lan_monitor_loop(),
-                "ledvance_lan_monitor",
-            )
+    @callback
+    def async_start_lan_monitor(self) -> None:
+        """Start one LAN monitor for this config entry after setup completes."""
+        self._lan_monitor_task = self.hass.async_create_background_task(
+            self._lan_monitor_loop(), "ledvance_lan_monitor"
+        )
 
-        return devices_data
+    @callback
+    def _async_update_device(self, device: CoordinatorDeviceData) -> None:
+        """Publish a LAN or optimistic update without moving the cloud deadline."""
+        self.data = {**self.data, device.device_id: device}
+        self.async_update_listeners()
 
+    @callback
     def async_optimistic_update(self, device_id: str, dps_patch: dict) -> None:
         """Immediately apply a DPS patch to the cached data without a network round-trip.
 
@@ -130,8 +148,7 @@ class LedvanceTuyaCoordinator(DataUpdateCoordinator[DevicesData]):
         if self.data is None or device_id not in self.data:
             return
         dev = self.data[device_id]
-        patched = replace(dev, dps={**dev.dps, **dps_patch})
-        self.async_set_updated_data({**self.data, device_id: patched})
+        self._async_update_device(replace(dev, dps={**dev.dps, **dps_patch}))
 
     def _fetch_all_devices(self) -> DevicesData:
         """Synchronous: fetch all devices from all groups."""
@@ -143,67 +160,90 @@ class LedvanceTuyaCoordinator(DataUpdateCoordinator[DevicesData]):
         result: DevicesData = {}
         try:
             groups = self.api.groups()
+        except (InvalidAuthentication, InvalidUserSession, TooManyRequests, CannotConnect):
+            raise
         except Exception as exc:
-            raise CannotConnect(f"Failed to fetch groups: {exc}") from exc
+            raise CannotConnect("Failed to fetch cloud groups") from exc
+        if not isinstance(groups, list):
+            raise CannotConnect("Cloud API returned an invalid group list")
 
+        device_jobs: list[tuple[TuyaDeviceInfo, dict]] = []
         for group in groups:
+            if not isinstance(group, dict):
+                continue
             group_id = str(group.get("groupId") or group.get("locationId") or "")
             if not group_id:
                 continue
             try:
-                devices: list[DeviceInfo] = self.api.devices(group_id)
+                devices: list[TuyaDeviceInfo] = self.api.devices(group_id)
+            except (InvalidAuthentication, InvalidUserSession, TooManyRequests, CannotConnect):
+                raise
             except Exception as exc:  # noqa: BLE001
-                _LOGGER.warning("Failed to fetch devices for group %s: %s", group_id, exc)
+                _LOGGER.warning("Failed to fetch devices for group %s: %s", group_id, type(exc).__name__)
                 continue
+            device_jobs.extend((dev, self._lan_cache.get(dev.dev_id, {})) for dev in devices)
 
-            for dev_info in devices:
-                # Get fresh DPS — try LAN first, fall back to cloud
-                lan = self._lan_cache.get(dev_info.dev_id, {})
-                dps = self._poll_dps_local(
-                    dev_info.dev_id,
-                    lan.get("ip"),
-                    dev_info.local_key,
-                    lan.get("version"),
-                )
-                if dps is not None:
-                    _LOGGER.debug("DPS for '%s' fetched via LAN", dev_info.name)
-                else:
-                    try:
-                        dps = self.api.get_dps(dev_info.dev_id)
-                    except Exception as exc:  # noqa: BLE001
-                        _LOGGER.warning("Failed to fetch DPS for %s: %s", dev_info.dev_id, exc)
-                        dps = dev_info.dps  # last resort: keep previous values
-
-                device_type = detect_device_type(dev_info.schema, dev_info.product_id)
-                dps_map = get_dps_map(dev_info.schema)
-
-                # If the device responded on LAN it's definitely online;
-                # fall back to cloud's is_online only when LAN isn't available.
-                lan_ip = lan.get("ip")
-                lan_reachable = dps is not None and bool(lan_ip)
-                is_online = lan_reachable or dev_info.is_online
-
-                result[dev_info.dev_id] = CoordinatorDeviceData(
-                    device_id=dev_info.dev_id,
-                    gateway_id=dev_info.gateway_id,
-                    name=dev_info.name,
-                    product_id=dev_info.product_id,
-                    device_type=device_type,
-                    schema=dev_info.schema,
-                    dps_map=dps_map,
-                    dps=dps,
-                    local_key=dev_info.local_key,
-                    mac=dev_info.mac,
-                    is_online=is_online,
-                    ip=dev_info.ip,
-                    lan_ip=lan_ip,
-                    version=lan.get("version"),  # LAN scan only — cloud pv is unrelated
-                    fw_version=dev_info.fw_version,
-                    room_name=dev_info.room_name,
-                )
+        # At most three devices are polled concurrently. Each cloud worker uses
+        # its own Session, avoiding unsafe sharing of requests connection state.
+        with ThreadPoolExecutor(max_workers=3, thread_name_prefix="ledvance-poll") as pool:
+            futures = [(dev.dev_id, pool.submit(self._fetch_device, dev, lan)) for dev, lan in device_jobs]
+            for device_id, future in futures:
+                try:
+                    device = future.result()
+                except (TypeError, ValueError, OverflowError) as exc:
+                    _LOGGER.warning("Skipping device %s with invalid metadata (%s)", device_id, type(exc).__name__)
+                    continue
+                result[device.device_id] = device
 
         _LOGGER.debug("Fetched %d devices from cloud", len(result))
         return result
+
+    def _fetch_device(self, dev_info: TuyaDeviceInfo, lan: dict) -> CoordinatorDeviceData:
+        """Poll a device with LAN priority and bounded cloud failure backoff."""
+        schema = normalize_schema(dev_info.schema)
+        dps = self._poll_dps_local(
+            dev_info.dev_id, lan.get("ip"), dev_info.local_key, lan.get("version")
+        )
+        lan_reachable = dps is not None
+        if not lan_reachable:
+            now = time.monotonic()
+            if now >= self._cloud_retry_after.get(dev_info.dev_id, 0):
+                try:
+                    dps = self.api.get_dps(dev_info.dev_id)
+                    self._cloud_retry_after.pop(dev_info.dev_id, None)
+                except (InvalidAuthentication, InvalidUserSession, TooManyRequests):
+                    raise
+                except Exception as exc:  # noqa: BLE001
+                    # Don't retry a persistently failing device on every refresh.
+                    self._cloud_retry_after[dev_info.dev_id] = now + 60
+                    _LOGGER.warning(
+                        "Cloud DPS for %s unavailable (%s); retrying later",
+                        dev_info.dev_id, type(exc).__name__,
+                    )
+            if dps is None:
+                dps = dev_info.dps
+        if not isinstance(dps, dict):
+            raise ValueError("Unexpected device state")
+
+        return CoordinatorDeviceData(
+            device_id=dev_info.dev_id,
+            gateway_id=dev_info.gateway_id,
+            name=dev_info.name,
+            product_id=dev_info.product_id,
+            device_type=detect_device_type(schema, dev_info.product_id),
+            schema=schema,
+            dps_map=get_dps_map(schema),
+            dps=dps,
+            local_key=dev_info.local_key,
+            mac=dev_info.mac,
+            is_online=lan_reachable or dev_info.is_online,
+            ip=dev_info.ip,
+            lan_ip=lan.get("ip"),
+            version=lan.get("version"),
+            fw_version=dev_info.fw_version,
+            room_name=dev_info.room_name,
+            lan_reachable=lan_reachable,
+        )
 
     @staticmethod
     def _poll_dps_local(
@@ -223,20 +263,29 @@ class LedvanceTuyaCoordinator(DataUpdateCoordinator[DevicesData]):
             import tinytuya  # noqa: PLC0415
         except ImportError:
             return None
-        try:
-            d = tinytuya.OutletDevice(
-                dev_id=device_id,
-                address=ip,
-                local_key=local_key,
-                version=float(version),
-            )
-            d.set_socketTimeout(3)
-            status = d.status()
-            if isinstance(status, dict) and "Error" not in status:
-                raw = status.get("dps", {})
-                return {str(k): v for k, v in raw.items()}
-        except Exception as exc:  # noqa: BLE001
-            _LOGGER.debug("Local DPS poll failed for %s (%s): %s", device_id, ip, exc)
+        with device_lock(device_id):
+            d = None
+            try:
+                d = tinytuya.OutletDevice(
+                    dev_id=device_id,
+                    address=ip,
+                    local_key=local_key,
+                    version=float(version),
+                )
+                d.set_socketTimeout(3)
+                status = d.status()
+                if isinstance(status, dict) and "Error" not in status:
+                    raw = status.get("dps")
+                    if isinstance(raw, dict) and raw:
+                        return {str(k): v for k, v in raw.items()}
+            except Exception as exc:  # noqa: BLE001
+                _LOGGER.debug(
+                    "Local DPS poll failed for %s (%s): %s", device_id, ip, type(exc).__name__
+                )
+            finally:
+                if d is not None:
+                    with suppress(Exception):
+                        d.close()
         return None
 
     async def _lan_monitor_loop(self) -> None:
@@ -271,33 +320,29 @@ class LedvanceTuyaCoordinator(DataUpdateCoordinator[DevicesData]):
                         dps = await self.hass.async_add_executor_job(
                             self._poll_dps_local, dev_id, ip, dev.local_key, version
                         )
-                        lan_online = dps is not None
-
-                        # Only push an update when something actually changed.
-                        current = self.data.get(dev_id) if self.data else None
-                        if current is not None and (
-                            lan_online != current.is_online
-                            or (dps is not None and dps != current.dps)
+                        lan_reachable = dps is not None
+                        # A poll must not overwrite a newer discovery or command result.
+                        if (self.data or {}).get(dev_id) is dev and (
+                            lan_reachable != dev.lan_reachable or (dps is not None and dps != dev.dps)
                         ):
-                            updated = replace(
-                                current,
-                                is_online=lan_online,
-                                dps=dps if dps is not None else current.dps,
-                            )
-                            self.async_set_updated_data({**self.data, dev_id: updated})
+                            self._async_update_device(replace(
+                                dev,
+                                dps=dps if dps is not None else dev.dps,
+                                is_online=lan_reachable or dev.is_online,
+                                lan_reachable=lan_reachable,
+                            ))
 
                     await asyncio.sleep(gap)
         except asyncio.CancelledError:
             pass
 
     async def async_shutdown(self) -> None:
-        """Cancel the LAN monitor background task."""
+        """Stop the coordinator timer and cancel the LAN monitor."""
+        await super().async_shutdown()
         if self._lan_monitor_task and not self._lan_monitor_task.done():
             self._lan_monitor_task.cancel()
-            try:
+            with suppress(asyncio.CancelledError):
                 await self._lan_monitor_task
-            except asyncio.CancelledError:
-                pass
 
     def _scan_lan(self) -> dict[str, dict]:
         """Synchronous: scan LAN for Tuya devices. Returns {device_id: {ip, version}}."""
@@ -328,3 +373,31 @@ class LedvanceTuyaCoordinator(DataUpdateCoordinator[DevicesData]):
             _LOGGER.debug("tinytuya scan error: %s", exc)
         _LOGGER.debug("LAN scan result: %d device(s) found: %s", len(found), list(found.keys()))
         return found
+
+
+class LedvanceDeviceEntity(CoordinatorEntity[LedvanceTuyaCoordinator]):
+    """A coordinator entity that can outlive an individual discovery result."""
+
+    def __init__(self, coordinator: LedvanceTuyaCoordinator, device_id: str) -> None:
+        super().__init__(coordinator)
+        self._device_id = device_id
+        self._attr_device_info = build_device_info(coordinator.data[device_id])
+
+    @property
+    def _device_data(self) -> CoordinatorDeviceData | None:
+        return (self.coordinator.data or {}).get(self._device_id)
+
+    @property
+    def _state_dps(self) -> dict[str, object]:
+        device = self._device_data
+        return device.dps if device is not None else {}
+
+    @property
+    def _device_is_online(self) -> bool:
+        device = self._device_data
+        return device is not None and device.is_online
+
+    @property
+    def available(self) -> bool:
+        device = self._device_data
+        return device is not None and (super().available or device.lan_reachable)

@@ -163,3 +163,47 @@ class TestConfigFlowDuplicatePrevention:
             )
 
         assert result["type"] == data_entry_flow.FlowResultType.CREATE_ENTRY
+
+
+class TestReauthentication:
+    async def test_reauth_updates_password_and_clears_tokens(self, hass):
+        from pytest_homeassistant_custom_component.common import MockConfigEntry
+
+        entry = MockConfigEntry(
+            domain=DOMAIN,
+            data={**VALID_INPUT, "_sid": "old-sid", "_refresh_token": "old-refresh"},
+            unique_id="user@example.com_EU",
+        )
+        entry.add_to_hass(hass)
+        with _patch_validate(), patch.object(hass.config_entries, "async_reload", return_value=True):
+            result = await hass.config_entries.flow.async_init(
+                DOMAIN,
+                context={"source": config_entries.SOURCE_REAUTH, "entry_id": entry.entry_id},
+                data=entry.data,
+            )
+            assert result["step_id"] == "reauth_confirm"
+            result = await hass.config_entries.flow.async_configure(
+                result["flow_id"], user_input={CONF_PASSWORD: "new-password"}
+            )
+        assert result["type"] == data_entry_flow.FlowResultType.ABORT
+        assert entry.data[CONF_PASSWORD] == "new-password"
+        assert not entry.data["_sid"]
+        assert not entry.data["_refresh_token"]
+
+    async def test_reauth_invalid_password_does_not_update(self, hass):
+        from pytest_homeassistant_custom_component.common import MockConfigEntry
+
+        entry = MockConfigEntry(domain=DOMAIN, data=VALID_INPUT, unique_id="user@example.com_EU")
+        entry.add_to_hass(hass)
+        with _patch_validate(InvalidAuthentication()):
+            result = await hass.config_entries.flow.async_init(
+                DOMAIN,
+                context={"source": config_entries.SOURCE_REAUTH, "entry_id": entry.entry_id},
+                data=entry.data,
+            )
+            result = await hass.config_entries.flow.async_configure(
+                result["flow_id"], user_input={CONF_PASSWORD: "wrong"}
+            )
+        assert result["type"] == data_entry_flow.FlowResultType.FORM
+        assert result["errors"]["base"] == "invalid_auth"
+        assert entry.data[CONF_PASSWORD] == VALID_INPUT[CONF_PASSWORD]

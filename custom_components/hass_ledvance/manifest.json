@@ -1,16 +1,22 @@
 {
   "domain": "hass_ledvance",
   "name": "Ledvance / Tuya",
-  "codeowners": ["@buggedcom"],
+  "categories": [
+    "lighting",
+    "plugs_switches"
+  ],
+  "codeowners": [
+    "@buggedcom",
+    "@Kosztyk"
+  ],
   "config_flow": true,
   "dependencies": [],
-  "documentation": "https://github.com/buggedcom/hass-ledvance/",
+  "documentation": "https://github.com/Kosztyk/hass-ledvance#readme",
   "iot_class": "local_polling",
-  "issue_tracker": "https://github.com/buggedcom/hass-ledvance/issues",
+  "issue_tracker": "https://github.com/Kosztyk/hass-ledvance/issues",
   "requirements": [
     "pycryptodome>=3.17",
-    "requests>=2.31.0",
     "tinytuya>=1.17.4"
   ],
-  "version": "0.1.0"
+  "version": "0.2.1"
 }

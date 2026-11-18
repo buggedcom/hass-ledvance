@@ -1,7 +1,6 @@
 """Tests for custom_components.hass_ledvance.schema_parser."""
-from __future__ import annotations
 
-import pytest
+from __future__ import annotations
 
 from custom_components.hass_ledvance.schema_parser import (
     detect_device_type,
@@ -12,7 +11,6 @@ from custom_components.hass_ledvance.schema_parser import (
     get_socket_outlet_dps,
     has_hardware_master,
 )
-
 
 # ---------------------------------------------------------------------------
 # detect_device_type
@@ -65,7 +63,6 @@ class TestDetectDeviceType:
         ]
         assert detect_device_type(schema, "any") == "light"
 
-
 # ---------------------------------------------------------------------------
 # get_dps_map
 # ---------------------------------------------------------------------------
@@ -97,7 +94,6 @@ class TestGetDpsMap:
     def test_empty_schema(self):
         assert get_dps_map([]) == {}
 
-
 # ---------------------------------------------------------------------------
 # get_integer_range
 # ---------------------------------------------------------------------------
@@ -121,7 +117,6 @@ class TestGetIntegerRange:
         schema = [{"id": 1, "code": "val"}]
         assert get_integer_range(schema, "val") == (0, 1000)
 
-
 # ---------------------------------------------------------------------------
 # get_numeric_scale
 # ---------------------------------------------------------------------------
@@ -137,13 +132,20 @@ class TestGetNumericScale:
         # bright_value has scale 0
         assert get_numeric_scale(light_schema, "bright_value") == 1.0
 
-    def test_missing_code_returns_1(self, light_schema):
-        assert get_numeric_scale(light_schema, "nonexistent") == 1.0
+    def test_missing_code_returns_none(self, light_schema):
+        assert get_numeric_scale(light_schema, "nonexistent") is None
 
-    def test_missing_scale_key_defaults_to_0(self):
+    def test_missing_scale_key_returns_none(self):
         schema = [{"id": 1, "code": "val", "property": {"min": 0, "max": 100}}]
-        assert get_numeric_scale(schema, "val") == 1.0
+        assert get_numeric_scale(schema, "val") is None
 
+    def test_malformed_scale_returns_none(self):
+        schema = [{"id": 1, "code": "val", "property": '{"scale":"invalid"}'}]
+        assert get_numeric_scale(schema, "val") is None
+
+    def test_unreasonable_scale_returns_none(self):
+        schema = [{"id": 1, "code": "val", "property": {"scale": -100}}]
+        assert get_numeric_scale(schema, "val") is None
 
 # ---------------------------------------------------------------------------
 # get_enum_range
@@ -160,7 +162,6 @@ class TestGetEnumRange:
     def test_empty_range(self):
         schema = [{"id": 1, "code": "mode", "property": {"range": []}}]
         assert get_enum_range(schema, "mode") == []
-
 
 # ---------------------------------------------------------------------------
 # get_socket_outlet_dps
@@ -228,13 +229,12 @@ class TestGetSocketOutletDps:
         ]
         result = get_socket_outlet_dps(schema)
         # master_switch wins; switch_all should not appear
-        master_entries = [(c, l) for c, l in result if c in ("master_switch", "switch_all")]
+        master_entries = [(code, label) for code, label in result if code in ("master_switch", "switch_all")]
         assert len(master_entries) == 1
         assert master_entries[0][0] == "master_switch"
 
     def test_empty_schema(self):
         assert get_socket_outlet_dps([]) == []
-
 
 # ---------------------------------------------------------------------------
 # has_hardware_master

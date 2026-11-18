@@ -5,10 +5,11 @@ Two categories:
   - Alarm / fault (socket_strip only)  — overvoltage, overcurrent, overtemperature,
                                          leakage-current fault flag
 """
+
 from __future__ import annotations
 
-from dataclasses import dataclass
 import logging
+from dataclasses import dataclass
 from typing import Any
 
 from homeassistant.components.binary_sensor import (
@@ -20,7 +21,6 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import EntityCategory
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
-from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import (
     DOMAIN,
@@ -33,7 +33,8 @@ from .const import (
     FAULT_OVERTEMP_BIT,
     FAULT_OVERVOLTAGE_BIT,
 )
-from .coordinator import CoordinatorDeviceData, LedvanceTuyaCoordinator, build_device_info
+from .coordinator import CoordinatorDeviceData, LedvanceDeviceEntity, LedvanceTuyaCoordinator
+from .entity_discovery import register_discovered_entities
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -42,25 +43,30 @@ _LOGGER = logging.getLogger(__name__)
 # Alarm sensor descriptions (socket_strip)
 # ---------------------------------------------------------------------------
 
+
 @dataclass(frozen=True, kw_only=True)
 class LedvanceAlarmDescription(BinarySensorEntityDescription):
     """Alarm binary sensor with an accessor callback."""
+
     # Returns True when the alarm condition is active
     is_on_fn: Any  # Callable[[CoordinatorDeviceData], bool | None]
 
 
 def _dps_flag(dps_code: str):
     """Return a lambda that reads a plain boolean DPS."""
+
     def _fn(dev: CoordinatorDeviceData) -> bool | None:
         dps_num = dev.dps_map.get(dps_code)
         if dps_num is None:
             return None
         return bool(dev.dps.get(dps_num))
+
     return _fn
 
 
 def _fault_bit(bit_mask: int):
     """Return a lambda that tests a specific bit in the 'fault' integer DPS."""
+
     def _fn(dev: CoordinatorDeviceData) -> bool | None:
         dps_num = dev.dps_map.get(DPS_FAULT)
         if dps_num is None:
@@ -69,6 +75,7 @@ def _fault_bit(bit_mask: int):
         if raw is None:
             return None
         return bool(int(raw) & bit_mask)
+
     return _fn
 
 
@@ -135,6 +142,7 @@ ALARM_DESCRIPTIONS: tuple[LedvanceAlarmDescription, ...] = (
 # Setup
 # ---------------------------------------------------------------------------
 
+
 async def async_setup_entry(
     hass: HomeAssistant,
     entry: ConfigEntry,
@@ -142,9 +150,9 @@ async def async_setup_entry(
 ) -> None:
     """Set up Ledvance/Tuya binary sensor entities."""
     coordinator: LedvanceTuyaCoordinator = hass.data[DOMAIN][entry.entry_id]
-    entities: list[BinarySensorEntity] = []
 
-    for dev_id, dev in coordinator.data.items():
+    def build_entities(dev_id: str, dev: CoordinatorDeviceData) -> list[BinarySensorEntity]:
+        entities: list[BinarySensorEntity] = []
         # Cloud connectivity — every device
         entities.append(LedvanceTuyaOnlineSensor(coordinator, entry, dev_id))
 
@@ -167,14 +175,17 @@ async def async_setup_entry(
                     if dps_code_map.get(desc.key, desc.key) in schema_codes:
                         entities.append(LedvanceAlarmSensor(coordinator, entry, dev_id, desc))
 
-    async_add_entities(entities)
+        return entities
+
+    register_discovered_entities(coordinator, entry, async_add_entities, build_entities)
 
 
 # ---------------------------------------------------------------------------
 # Entity classes
 # ---------------------------------------------------------------------------
 
-class LedvanceTuyaOnlineSensor(CoordinatorEntity[LedvanceTuyaCoordinator], BinarySensorEntity):
+
+class LedvanceTuyaOnlineSensor(LedvanceDeviceEntity, BinarySensorEntity):
     """Reports whether a Ledvance/Tuya device is reachable in the cloud."""
 
     _attr_has_entity_name = True
@@ -188,21 +199,15 @@ class LedvanceTuyaOnlineSensor(CoordinatorEntity[LedvanceTuyaCoordinator], Binar
         entry: ConfigEntry,
         device_id: str,
     ) -> None:
-        super().__init__(coordinator)
-        self._device_id = device_id
+        super().__init__(coordinator, device_id)
         self._attr_unique_id = f"{entry.entry_id}_{device_id}_online"
-        self._attr_device_info = build_device_info(coordinator.data[device_id])
-
-    @property
-    def _device_data(self) -> CoordinatorDeviceData:
-        return self.coordinator.data[self._device_id]
 
     @property
     def is_on(self) -> bool:
-        return self._device_data.is_online
+        return self._device_is_online
 
 
-class LedvanceAlarmSensor(CoordinatorEntity[LedvanceTuyaCoordinator], BinarySensorEntity):
+class LedvanceAlarmSensor(LedvanceDeviceEntity, BinarySensorEntity):
     """An alarm / fault binary sensor for a Ledvance/Tuya socket strip."""
 
     entity_description: LedvanceAlarmDescription
@@ -215,16 +220,11 @@ class LedvanceAlarmSensor(CoordinatorEntity[LedvanceTuyaCoordinator], BinarySens
         device_id: str,
         description: LedvanceAlarmDescription,
     ) -> None:
-        super().__init__(coordinator)
-        self._device_id = device_id
+        super().__init__(coordinator, device_id)
         self.entity_description = description
         self._attr_unique_id = f"{entry.entry_id}_{device_id}_{description.key}"
-        self._attr_device_info = build_device_info(coordinator.data[device_id])
-
-    @property
-    def _device_data(self) -> CoordinatorDeviceData:
-        return self.coordinator.data[self._device_id]
 
     @property
     def is_on(self) -> bool | None:
-        return self.entity_description.is_on_fn(self._device_data)
+        device = self._device_data
+        return self.entity_description.is_on_fn(device) if device is not None else None

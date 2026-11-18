@@ -9,15 +9,29 @@
           "password": "Password",
           "region": "Region"
         }
+      },
+      "reauth_confirm": {
+        "title": "Reauthenticate Ledvance / Sylvania",
+        "description": "Enter the updated password for your existing app account.",
+        "data": {
+          "password": "Password"
+        }
       }
     },
     "error": {
       "cannot_connect": "Unable to reach the Tuya cloud — check your internet connection.",
       "invalid_auth": "Invalid email or password.",
+      "rate_limited": "The Tuya cloud is limiting requests. Try again in a few minutes.",
       "unknown": "Unexpected error — check the Home Assistant logs."
     },
     "abort": {
       "already_configured": "This account is already configured."
+    }
+  },
+  "issues": {
+    "legacy_local_key": {
+      "title": "Remove recorded Ledvance local keys",
+      "description": "An older version could publish device keys through these sensors: {entity_ids}. If you use Recorder, run `recorder.purge_entities` for those exact entity IDs in Developer tools. Then remove the obsolete entities and reload the integration. Backups may also contain the recorded values."
     }
   }
 }
