@@ -88,6 +88,8 @@ class TuyaAPI:
         post_data: dict | None = None,
         requires_sid: bool = True,
         do_not_relogin: bool = False,
+        quiet: bool = False,
+        api_version: str | None = None,
     ) -> dict | list:
         headers = {"User-Agent": TUYA_USER_AGENT}
         data = (
@@ -101,9 +103,10 @@ class TuyaAPI:
             sanitized_options["a"] = options["action"]
             del sanitized_options["action"]
 
-        api_version = API_VERSION_FOR_ACTION.get(
-            options.get("action", ""), DEFAULT_API_VERSION
-        )
+        if api_version is None:
+            api_version = API_VERSION_FOR_ACTION.get(
+                options.get("action", ""), DEFAULT_API_VERSION
+            )
 
         params = {
             "appVersion": "1.1.6",
@@ -139,7 +142,7 @@ class TuyaAPI:
                     self._endpoint, params=params, data=data, headers=headers, timeout=15
                 )
                 result = self._handle(
-                    response.json(), options.get("action", ""), api_version
+                    response.json(), options.get("action", ""), api_version, quiet
                 )
                 _LOGGER.debug("API %s → %s", options.get("action"), result)
                 return result
@@ -194,7 +197,9 @@ class TuyaAPI:
         prehash = hashlib.md5(data.encode("utf-8")).hexdigest()
         return prehash[8:16] + prehash[0:8] + prehash[24:32] + prehash[16:24]
 
-    def _handle(self, result: dict, action: str = "", api_version: str = "") -> dict | list:
+    def _handle(
+        self, result: dict, action: str = "", api_version: str = "", quiet: bool = False
+    ) -> dict | list:
         if result.get("success"):
             return result["result"]
         error_code = result.get("errorCode", "")
@@ -204,7 +209,7 @@ class TuyaAPI:
             raise InvalidAuthentication
         if error_code == "REQUEST_TOO_FREQUENTLY_PLEASE_TRY_AGAIN_LATER":
             raise TooManyRequests(result.get("errorMsg", "Rate limited"))
-        _LOGGER.error(
+        (_LOGGER.debug if quiet else _LOGGER.error)(
             "API error %s: %s (action=%s v=%s)",
             error_code, result.get("errorMsg"), action, api_version,
         )
@@ -305,17 +310,44 @@ class TuyaAPI:
         return self._api({"action": "tuya.m.location.list"})  # type: ignore[return-value]
 
     def rooms(self, group_id: str) -> dict[str, str]:
-        """Return {roomId: roomName} for a location. Empty dict on failure."""
-        try:
-            raw = self._api({"action": "tuya.m.location.room.list", "gid": group_id})
-            return {
+        """Return {roomId: roomName} for a location. Empty dict on failure.
+
+        Room names only feed the best-effort HA area assignment, so this is
+        cached per group and, once the cloud rejects every known API version,
+        not requested again for the rest of the session (it is polled every
+        30 s otherwise and floods the log with API_OR_API_VERSION_WRONG).
+        """
+        cache = self.__dict__.setdefault("_room_cache", {})
+        if group_id in cache:
+            return cache[group_id]
+        default = API_VERSION_FOR_ACTION.get("tuya.m.location.room.list", DEFAULT_API_VERSION)
+        for version in dict.fromkeys((default, "1.0", "3.0")):
+            try:
+                raw = self._api(
+                    {"action": "tuya.m.location.room.list", "gid": group_id},
+                    quiet=True,
+                    api_version=version,
+                )
+            except (InvalidUserSession, InvalidAuthentication, TooManyRequests, CannotConnect):
+                # Transient / session problem: try again on the next poll.
+                return {}
+            except Exception:  # noqa: BLE001
+                _LOGGER.debug("room.list v%s failed for group %s", version, group_id)
+                continue
+            rooms = {
                 str(room["roomId"]): room["name"]
                 for room in (raw or [])  # type: ignore[union-attr]
-                if "roomId" in room and "name" in room
+                if isinstance(room, dict) and "roomId" in room and "name" in room
             }
-        except Exception:  # noqa: BLE001
-            _LOGGER.debug("Could not fetch room list for group %s", group_id)
-            return {}
+            cache[group_id] = rooms
+            return rooms
+        _LOGGER.info(
+            "Tuya room list unavailable for group %s; skipping room-based area "
+            "assignment for this session",
+            group_id,
+        )
+        cache[group_id] = {}
+        return {}
 
     def devices(self, group_id: str) -> list[DeviceInfo]:
         """Return all devices in a group, with room names attached."""
